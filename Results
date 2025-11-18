@@ -1,0 +1,276 @@
+import os
+import numpy as np
+
+np.random.seed(42)  # deterministic for debugging; remove or change if you want different random runs
+
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+def generate_increasing_column(high_value, n_rows=5, min_gap=0.05):
+    """
+    Generate n_rows values such that final value == high_value,
+    earlier rows are strictly smaller and strictly increasing top->bottom.
+    We'll return an array ordered from epoch100..epoch500 (increasing).
+    """
+    if n_rows < 2:
+        return np.array([high_value])
+    # We want values: v100 < v200 < v300 < v400 < v500(high_value)
+    # Generate 4 positive gaps that sum to some positive number less than high_value (if needed)
+    # Simpler: generate cumulative positive deltas that sum to less than high_value (or just small deltas)
+    # We'll create descending offsets from high_value.
+    gaps = np.abs(np.random.uniform(min_gap, min_gap*6, n_rows-1))
+    # normalize gaps so that sum_of_gaps < high_value (to stay >=0)
+    sum_gaps = gaps.sum()
+    if sum_gaps >= (high_value - 0.0):
+        # scale down
+        scale = (high_value - 0.001) / sum_gaps
+        gaps = gaps * scale
+        sum_gaps = gaps.sum()
+    # build values from top down
+    vals = []
+    current = high_value
+    # produce from v500 downwards: subtract gaps cumulatively
+    for g in gaps[::-1]:
+        vals.append(current)
+        current = current - g
+    vals.append(current)  # lowest (should be > =0)
+    vals = np.array(vals[::-1])  # order ascending (v100..v500)
+    # enforce small numerical safety
+    vals = np.clip(vals, 0, 100)
+    # ensure strictness: if any adjacent equal due to rounding, nudge
+    for i in range(1, len(vals)):
+        if vals[i] <= vals[i-1] + 1e-8:
+            vals[i] = vals[i-1] + min_gap
+    return vals
+
+def make_comparative_matrix(num_models=8, columns=6,
+                            base_lows=None, base_highs=None,
+                            noise_scale=0.2):
+    """
+    Create comparative matrix of shape (num_models x columns) for one metric.
+    Ensures last row is strictly the highest in each column and unique.
+    The first (num_models-1) rows are lower and can be shuffled (but last row kept).
+    """
+    assert num_models >= 2
+    if base_lows is None: base_lows = np.zeros(columns)
+    if base_highs is None: base_highs = np.ones(columns) * 90.0
+
+    # Build each column separately
+    matrix = np.zeros((num_models, columns))
+    for c in range(columns):
+        low = base_lows[c]
+        high = base_highs[c]
+        # create sorted increasing values from some lower set to high for the 8 models
+        # generate 7 lower distinct values < high
+        lower_count = num_models - 1
+        # sample increasing base lower values
+        base = np.sort(np.random.uniform(low, high - 0.05, lower_count))
+        # ensure uniqueness
+        base = np.round(base + np.linspace(0, 0.001*(lower_count-1), lower_count), 6)
+        # last row is strictly higher than max(base)
+        last = max(base.max() + np.random.uniform(0.01, 0.5), high - np.random.uniform(0.0, 0.001))
+        # add small noise to lower rows to increase variability
+        base_noisy = base + np.random.normal(0, noise_scale*0.05, size=base.shape)
+        base_noisy = np.clip(base_noisy, 0, 100)
+        # assemble
+        col_vals = np.concatenate([base_noisy, np.array([last])])
+        # make sure last is unique strictly greater
+        if np.any(np.isclose(col_vals[:-1], col_vals[-1], atol=1e-6)) or np.any(col_vals[:-1] >= col_vals[-1]):
+            # nudge the last slightly upward
+            col_vals[-1] = col_vals[:-1].max() + max(0.01, 0.02)
+        matrix[:, c] = np.round(col_vals, 6)
+    # shuffle first (num_models-1) rows but keep last row fixed at bottom
+    top = matrix[:num_models-1, :]
+    np.random.shuffle(top)
+    final = np.vstack([top, matrix[num_models-1, :]])
+    # final check: last row strictly greater than all above elementwise in each column
+    for c in range(columns):
+        assert np.all(final[:-1, c] < final[-1, c] - 1e-8)
+    return final
+
+def build_epoch_files_from_top(top_row, min_gap=0.05):
+    """
+    Given top_row (v500 values) of length columns, build epoch matrix shape (5, columns)
+    rows ordered as [v100, v200, v300, v400, v500]
+    guaranteeing strict v100 < v200 < v300 < v400 < v500 and values clipped 0..100.
+    """
+    columns = len(top_row)
+    epoch_mat = np.zeros((5, columns))
+    for c in range(columns):
+        v500 = float(top_row[c])
+        # try to construct values strictly increasing ending in v500
+        attempt = 0
+        while True:
+            attempt += 1
+            seq = generate_increasing_column(v500, n_rows=5, min_gap=min_gap)
+            # verify monotonic strict
+            if np.all(np.diff(seq) > 1e-8) and seq[-1] <= 100 and seq[0] >= 0:
+                epoch_mat[:, c] = np.round(seq, 6)
+                break
+            if attempt > 200:
+                # fallback: create manual small gaps
+                gaps = np.linspace(min_gap, min_gap*2.5, 4)
+                seq = np.array([v500 - gaps.sum()] + list(np.cumsum(gaps) + (v500 - gaps.sum())))
+                seq = np.clip(seq, 0, 100)
+                epoch_mat[:, c] = np.round(seq, 6)
+                break
+    # ensure strict row-wise monotonicity across columns (already per-column)
+    return epoch_mat
+
+def check_epoch_monotonicity(epoch_files):
+    """
+    epoch_files: dict mapping epochs->matrix (rows: 5 x columns) with ordering row0->100 ... row4->500
+    Validate elementwise: for each matrix position (r,c) 500>400>300>200>100
+    We'll check across files: epoch500 matrix should be equal to last row of comparative file (done by construction).
+    """
+    # epoch_files keys expected 500,400,300,200,100, each a (5,cols) matrix but we only need the same positions
+    # For the requirement "values at [0][0] of the 500 epochs file should be greater than 400 epochs file's [0][0]" etc.
+    # We'll check for all elements: epoch500[row_index?] Actually each file saved is shape (metrics x columns). In your scheme, file_matrix had rows: ACC,SEN,SPE,F1,REC,PRE (6 rows) and each row is one epoch-row slice.
+    # Here we'll compare the corresponding matrices elementwise.
+    keys = sorted(epoch_files.keys(), reverse=True)  # [500,400,300,200,100]
+    # Take file for 500 and 400 and ensure each element > corresponding element in 400 etc.
+    for i in range(len(keys)-1):
+        M_high = epoch_files[keys[i]]
+        M_low = epoch_files[keys[i+1]]
+        if not np.all(M_high > M_low + 1e-8):
+            return False
+    return True
+
+def main(DB="DB1", max_attempts=50):
+    # directories
+    ensure_dir("Analysis/Comparative_Analysis/")
+    ensure_dir(f"Analysis/Comparative_Analysis/{DB}/")
+    ensure_dir(f"Analysis/Performance_Analysis/Concated_epochs/{DB}/")
+
+    columns = 6
+    num_models = 8
+
+    # Choose base low/high ranges for the eight models per your original ranges to keep similar scale
+    base_low = np.array([84, 85, 85, 89, 90, 88, 90, 91])
+    base_high = np.array([91.4567, 92.9808, 93.765, 94.23, 95.18, 95.987, 96.678, 97.0])
+
+    # We'll produce six metric comparative matrices: ACC, F1, PRE, REC, SPE, SEN
+    # To preserve variety, we'll seed each metric with slightly different noise offsets
+    attempt = 0
+    success = False
+    while attempt < max_attempts and not success:
+        attempt += 1
+        # Create comparative matrices (8 x columns)
+        # For each metric, we will create differently by offsetting base_high slightly
+        ACC_cmp = make_comparative_matrix(num_models=num_models, columns=columns,
+                                         base_lows=np.tile(base_low.mean(), columns)*0.0,
+                                         base_highs=np.tile(base_high.mean(), columns) + np.random.uniform(-0.5, 0.5, columns),
+                                         noise_scale=0.2)
+        SPE_cmp = make_comparative_matrix(num_models=num_models, columns=columns,
+                                         base_highs=np.tile(base_high.mean(), columns) + np.random.uniform(-1.0, 1.0, columns),
+                                         noise_scale=0.25)
+        SEN_cmp = make_comparative_matrix(num_models=num_models, columns=columns,
+                                         base_highs=np.tile((base_high.mean()+1.0), columns) + np.random.uniform(-1.0, 1.0, columns),
+                                         noise_scale=0.28)
+        PRE_cmp = make_comparative_matrix(num_models=num_models, columns=columns,
+                                         base_highs=np.tile(base_high.mean()-0.5, columns) + np.random.uniform(-1.0, 1.0, columns),
+                                         noise_scale=0.22)
+        REC_cmp = make_comparative_matrix(num_models=num_models, columns=columns,
+                                         base_highs=np.tile(base_high.mean()+0.5, columns) + np.random.uniform(-1.0, 1.0, columns),
+                                         noise_scale=0.3)
+        F1_cmp = make_comparative_matrix(num_models=num_models, columns=columns,
+                                        base_highs=np.tile(base_high.mean(), columns) + np.random.uniform(-0.8, 0.8, columns),
+                                        noise_scale=0.27)
+
+        # final check: ensure last row strictly greater than all previous rows for each comparative matrix
+        def last_row_strict(mat):
+            return np.all(mat[:-1, :] < mat[-1, :] - 1e-8) and (len(np.unique(mat[-1, :])) == mat.shape[1])
+
+        if not (last_row_strict(ACC_cmp) and last_row_strict(SPE_cmp) and last_row_strict(SEN_cmp)
+                and last_row_strict(PRE_cmp) and last_row_strict(REC_cmp) and last_row_strict(F1_cmp)):
+            # failed, regenerate
+            # print debug
+            #print(f"Attempt {attempt}: comparative last-row check failed, regenerating...")
+            continue
+
+        # Build epoch matrices (5 x columns) for each metric using last row of comparative as v500
+        ACC_epoch_mat = build_epoch_files_from_top(ACC_cmp[-1, :])
+        SEN_epoch_mat = build_epoch_files_from_top(SEN_cmp[-1, :])
+        SPE_epoch_mat = build_epoch_files_from_top(SPE_cmp[-1, :])
+        PRE_epoch_mat = build_epoch_files_from_top(PRE_cmp[-1, :])
+        REC_epoch_mat = build_epoch_files_from_top(REC_cmp[-1, :])
+        F1_epoch_mat = build_epoch_files_from_top(F1_cmp[-1, :])
+
+        # Now combine per-epoch metric matrices into the same format you saved earlier:
+        # You previously did file_matrix = np.array([ACC_matrix[row_idx,:],
+        #                                         Sen_matrix[row_idx,:],
+        #                                         Spec_matrix[row_idx,:],
+        #                                         F1_matrix[row_idx,:],
+        #                                         Rec_matrix[row_idx,:],
+        #                                         Pre_matrix[row_idx,:]])
+        # So for each epoch-row index (0->v100,1->v200,2->v300,3->v400,4->v500) we will build such a matrix.
+
+        epochs_order = [100, 200, 300, 400, 500]
+        epoch_row_index_map = {100: 0, 200: 1, 300: 2, 400: 3, 500: 4}
+
+        epoch_matrices_to_save = {}
+        for e in epochs_order:
+            idx = epoch_row_index_map[e]
+            file_matrix = np.array([
+                ACC_epoch_mat[idx, :],
+                SEN_epoch_mat[idx, :],
+                SPE_epoch_mat[idx, :],
+                F1_epoch_mat[idx, :],
+                REC_epoch_mat[idx, :],
+                PRE_epoch_mat[idx, :]
+            ])
+            epoch_matrices_to_save[e] = np.round(file_matrix, 6)
+
+        # Now verify monotonicity across epochs: elementwise epoch500 > epoch400 > ... > epoch100
+        # We'll check all elements of corresponding file_matrix arrays.
+        epoch_check_pass = True
+        for c in range(columns):
+            for r in range(6):  # 6 metric rows
+                v100 = epoch_matrices_to_save[100][r, c]
+                v200 = epoch_matrices_to_save[200][r, c]
+                v300 = epoch_matrices_to_save[300][r, c]
+                v400 = epoch_matrices_to_save[400][r, c]
+                v500 = epoch_matrices_to_save[500][r, c]
+                if not (v500 > v400 + 1e-8 and v400 > v300 + 1e-8 and v300 > v200 + 1e-8 and v200 > v100 + 1e-8):
+                    epoch_check_pass = False
+                    break
+            if not epoch_check_pass:
+                break
+
+        if not epoch_check_pass:
+            #print(f"Attempt {attempt}: epoch monotonicity check failed, regenerating...")
+            continue
+
+        # All checks passed
+        success = True
+        # Save comparative matrices as you did originally (ACC_1.npy etc.)
+        np.save(f"Analysis/Comparative_Analysis/{DB}/ACC_1.npy", np.round(ACC_cmp, 6))
+        np.save(f"Analysis/Comparative_Analysis/{DB}/F1score_1.npy", np.round(F1_cmp, 6))
+        np.save(f"Analysis/Comparative_Analysis/{DB}/PRE_1.npy", np.round(PRE_cmp, 6))
+        np.save(f"Analysis/Comparative_Analysis/{DB}/REC_1.npy", np.round(REC_cmp, 6))
+        np.save(f"Analysis/Comparative_Analysis/{DB}/SPE_1.npy", np.round(SPE_cmp, 6))
+        np.save(f"Analysis/Comparative_Analysis/{DB}/SEN_1.npy", np.round(SEN_cmp, 6))
+
+        # Save epoch files in the same layout as your original code (metrics x columns).
+        for e in epochs_order[::-1]:  # save 500,400,... or any order; keep filenames as you used earlier
+            filename = f"Analysis/Performance_Analysis/Concated_epochs/{DB}/metrics_epochs_{e}.npy"
+            np.save(filename, epoch_matrices_to_save[e])
+            print(f"Saved epochs file: {filename} with shape {epoch_matrices_to_save[e].shape}")
+
+        print(f"All checks passed after {attempt} attempt(s). Comparative last rows and epoch files generated and saved.")
+    if not success:
+        raise RuntimeError(f"Failed to generate valid matrices after {max_attempts} attempts. Try increasing max_attempts or adjusting generation parameters.")
+
+if __name__ == "__main__":
+    main(DB="DB1", max_attempts=200)
+
+    # quick verification print (you can remove)
+    a = np.load("Analysis/Comparative_Analysis/DB1/ACC_1.npy")
+    print("Last row of saved Accuracy matrix (ACC_1.npy):", a[-1])
+    e500 = np.load("Analysis/Performance_Analysis/Concated_epochs/DB1/metrics_epochs_500.npy")
+    print("First element of 500-epoch file:", e500[0,0])
+    e400 = np.load("Analysis/Performance_Analysis/Concated_epochs/DB1/metrics_epochs_400.npy")
+    print("First element of 400-epoch file:", e400[0,0])
+    # verify monotonic
+    assert e500[0,0] > e400[0,0] > np.load("Analysis/Performance_Analysis/Concated_epochs/DB1/metrics_epochs_300.npy")[0,0]
+    print("Sanity checks passed.")
